@@ -1,0 +1,205 @@
+import os
+import re
+import json
+import shutil
+from multiprocessing import Pool, Manager, cpu_count
+from docx import Document
+from docx.shared import RGBColor
+import xlsxwriter
+from tqdm import tqdm
+
+# === CONFIG ===
+INPUT_FILE    = "input.txt"
+CHUNK_SIZE    = 2000
+EMAIL_REGEX   = r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b"
+OUTPUT_DOCX   = "final_output_ip.docx"
+OUTPUT_XLSX   = "final_output_ip.xlsx"
+TEMP_DIR      = "temp_parts"
+
+# === RECURSIVE FIELD FINDER ===
+def find_field(obj, val):
+    """Return list of keys leading to a string leaf == val, or None."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, list):
+                for item in v:
+                    if not isinstance(item, (dict, list)) and str(item) == val:
+                        return [k]
+                    sub = find_field(item, val)
+                    if sub:
+                        return [k] + sub
+            elif isinstance(v, dict):
+                sub = find_field(v, val)
+                if sub:
+                    return [k] + sub
+            else:
+                s = str(v)
+                if s == val:
+                    return [k]
+                if isinstance(v, str):
+                    parts = [p.strip() for p in s.split(',')]
+                    if val in parts:
+                        return [k]
+    elif isinstance(obj, list):
+        for item in obj:
+            sub = find_field(item, val)
+            if sub:
+                return sub
+    return None
+
+# === PARSE RECORDS BY CreateTime LINES ===
+def load_records():
+    records = []
+    last_id = None
+    ct_re   = re.compile(r"^CreateTime:(\d+)\s+(.*)$")
+    with open(INPUT_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+        for raw in f:
+            line = raw.rstrip('\r\n')
+            m = ct_re.match(line)
+            if m and last_id is not None:
+                records.append((last_id, m.group(1), m.group(2)))
+            elif line.strip():
+                last_id = line.strip()
+    return records
+
+# === CHUNKING ===
+def chunk_records(records):
+    for i in range(0, len(records), CHUNK_SIZE):
+        yield records[i:i+CHUNK_SIZE], i//CHUNK_SIZE
+
+# === WORKER ===
+def process_chunk(args):
+    chunk, idx, result_list = args
+    pattern = re.compile(EMAIL_REGEX)
+
+    doc = Document()
+    matches_data = []
+    seen = 0
+    with_ip = 0
+
+    for identifier, ts, payload in chunk:
+        seen += 1
+        mlist = list(pattern.finditer(payload))
+        if not mlist:
+            continue
+        with_ip += 1
+
+        # parse JSON once
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            obj = {}
+
+        # Word paragraph
+        para = doc.add_paragraph(f"{identifier} | CreateTime:{ts} | ")
+        last = 0
+
+        for mt in mlist:
+            s, e = mt.span()
+            # text before
+            if s > last:
+                para.add_run(payload[last:s])
+            # matched IP in red
+            ip = mt.group()
+            run = para.add_run(ip)
+            run.font.color.rgb = RGBColor(255, 0, 0)
+            last = e
+
+            # find field name
+            path = find_field(obj, ip) or []
+            field = ".".join(path)
+
+            # record for Excel
+            matches_data.append((identifier, ts, payload, ip, field))
+
+        # trailing text
+        if last < len(payload):
+            para.add_run(payload[last:])
+
+        # append all field names after payload
+        fields = [fld for _, _, _, _, fld in matches_data[-len(mlist):]]
+        para.add_run(" | field: ")
+        for i, fld in enumerate(fields):
+            if i:
+                para.add_run(", ")
+            fr = para.add_run(fld)
+            fr.font.color.rgb = RGBColor(255, 0, 0)
+
+    # save Word chunk if any matches
+    if matches_data:
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        doc.save(os.path.join(TEMP_DIR, f"chunk_{idx}.docx"))
+
+    result_list.append((matches_data, seen, with_ip))
+
+# === MERGE WORD ===
+def merge_word():
+    merged = Document()
+    for fn in tqdm(sorted(os.listdir(TEMP_DIR)), desc="Merging Word"):
+        if not fn.endswith(".docx"):
+            continue
+        doc = Document(os.path.join(TEMP_DIR, fn))
+        for para in doc.paragraphs:
+            p2 = merged.add_paragraph()
+            for run in para.runs:
+                nr = p2.add_run(run.text)
+                if run.font.color and run.font.color.rgb:
+                    nr.font.color.rgb = run.font.color.rgb
+                nr.bold = run.bold
+                nr.italic = run.italic
+                nr.underline = run.underline
+    merged.save(OUTPUT_DOCX)
+
+# === WRITE EXCEL ===
+def write_excel(all_matches):
+    wb = xlsxwriter.Workbook(OUTPUT_XLSX)
+    ws = wb.add_worksheet()
+    red = wb.add_format({'font_color': 'red'})
+
+    ws.write_row(0, 0, ["Identifier", "Timestamp", "Payload", "IP", "Field"])
+    r = 1
+    for idf, ts, payload, ip, field in all_matches:
+        ws.write(r, 0, idf)
+        ws.write(r, 1, ts)
+        ws.write(r, 2, payload)
+        ws.write(r, 3, ip, red)
+        ws.write(r, 4, field)
+        r += 1
+    wb.close()
+
+# === MAIN ===
+if __name__ == "__main__":
+    # cleanup
+    if os.path.isdir(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
+
+    print("=== IP EXTRACTOR w/ FIELD NAMES ===")
+    records = load_records()
+    print(f"Found {len(records)} records.")
+    chunks = list(chunk_records(records))
+
+    mgr = Manager()
+    results = mgr.list()
+
+    with Pool(min(cpu_count(), len(chunks))) as pool:
+        list(tqdm(pool.imap_unordered(
+            process_chunk,
+            [(chunk, idx, results) for chunk, idx in chunks]
+        ), total=len(chunks), desc="Processing"))
+
+    # aggregate
+    all_matches = []
+    tot = has_ip = 0
+    for data, seen, with_ip in results:
+        all_matches.extend(data)
+        tot += seen
+        has_ip += with_ip
+
+    print(f"Records scanned: {tot}, with IP: {has_ip}, matches: {len(all_matches)}")
+
+    if os.path.isdir(TEMP_DIR):
+        merge_word()
+    write_excel(all_matches)
+
+    print(f"\n→ Word: {OUTPUT_DOCX}")
+    print(f"→ Excel: {OUTPUT_XLSX}")
