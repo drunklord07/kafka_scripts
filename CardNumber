@@ -16,6 +16,11 @@ OUTPUT_DOCX    = "final_output_cardnumber.docx"
 OUTPUT_XLSX    = "final_output_cardnumber.xlsx"
 TEMP_DIR       = "temp_parts"
 
+# === CLEANER FOR XML-COMPATIBLE STRINGS ===
+def clean_xml_string(s: str) -> str:
+    # drop any control chars except \n, \r, \t
+    return ''.join(ch for ch in s if ch in '\n\r\t' or (0x20 <= ord(ch) <= 0xD7FF) or (0xE000 <= ord(ch) <= 0xFFFD))
+
 # === RECURSIVE FIELD FINDER ===
 def find_field(obj, val):
     """Return list of keys leading to a string leaf == val, or None."""
@@ -91,16 +96,18 @@ def process_chunk(args):
             obj = {}
 
         # Word paragraph
-        para = doc.add_paragraph(f"{identifier} | CreateTime:{ts} | ")
+        header = f"{identifier} | CreateTime:{ts} | "
+        para = doc.add_paragraph(clean_xml_string(header))
         last = 0
 
         for mt in mlist:
             s, e = mt.span()
-            # text before
+            # cleaned text before match
             if s > last:
-                para.add_run(payload[last:s])
+                snippet = clean_xml_string(payload[last:s])
+                para.add_run(snippet)
             # matched CardNumber in red
-            card = mt.group()
+            card = clean_xml_string(mt.group())
             run = para.add_run(card)
             run.font.color.rgb = RGBColor(255, 0, 0)
             last = e
@@ -114,7 +121,8 @@ def process_chunk(args):
 
         # trailing text
         if last < len(payload):
-            para.add_run(payload[last:])
+            trailing = clean_xml_string(payload[last:])
+            para.add_run(trailing)
 
         # append all field names after payload
         fields = [fld for _, _, _, _, fld in matches_data[-len(mlist):]]
@@ -122,7 +130,7 @@ def process_chunk(args):
         for i, fld in enumerate(fields):
             if i:
                 para.add_run(", ")
-            fr = para.add_run(fld)
+            fr = para.add_run(clean_xml_string(fld))
             fr.font.color.rgb = RGBColor(255, 0, 0)
 
     # save Word chunk if any matches
