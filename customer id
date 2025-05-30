@@ -1,0 +1,195 @@
+import os
+import json
+import shutil
+from multiprocessing import Pool, Manager, cpu_count
+from docx import Document
+from docx.shared import RGBColor
+import xlsxwriter
+from tqdm import tqdm
+
+# === CONFIG ===
+INPUT_FILE      = "input.txt"
+CHUNK_SIZE      = 2000
+KEYWORDS        = ["customer id", "cust id", "customer number"]
+OUTPUT_DOCX     = "final_output_customerid.docx"
+OUTPUT_XLSX     = "final_output_customerid.xlsx"
+TEMP_DIR        = "temp_parts"
+
+# === CLEANER FOR XML-COMPATIBLE STRINGS ===
+def clean_xml_string(s: str) -> str:
+    return ''.join(
+        ch for ch in s
+        if ch in "\n\r\t"
+        or (0x20 <= ord(ch) <= 0xD7FF)
+        or (0xE000 <= ord(ch) <= 0xFFFD)
+    )
+
+# === FIND ALL KEYS MATCHING OUR LIST ===
+def find_keys(obj, keywords, path=None):
+    if path is None:
+        path = []
+    matches = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k.strip().lower() in keywords:
+                matches.append((path + [k], v))
+            matches.extend(find_keys(v, keywords, path + [k]))
+    elif isinstance(obj, list):
+        for idx, item in enumerate(obj):
+            matches.extend(find_keys(item, keywords, path + [str(idx)]))
+    return matches
+
+# === INLINE HIGHLIGHT HELPER ===
+def add_highlighted_payload(para, payload, found):
+    intervals = []
+    low = payload.lower()
+    for path, val in found:
+        key = path[-1]
+        i = low.find(key.lower())
+        if i != -1:
+            intervals.append((i, i + len(key)))
+        v = str(val)
+        j = payload.find(v)
+        if j != -1:
+            intervals.append((j, j + len(v)))
+    intervals.sort(key=lambda x: x[0])
+
+    pos = 0
+    for start, end in intervals:
+        if start > pos:
+            para.add_run(clean_xml_string(payload[pos:start]))
+        run = para.add_run(clean_xml_string(payload[start:end]))
+        run.font.color.rgb = RGBColor(255, 0, 0)
+        pos = end
+    if pos < len(payload):
+        para.add_run(clean_xml_string(payload[pos:]))
+
+# === PARSE RECORDS ===
+def load_records():
+    import re
+    records, last_id = [], None
+    ct_re = re.compile(r"^CreateTime:(\d+)\s+(.*)$")
+    with open(INPUT_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+        for raw in f:
+            line = raw.rstrip('\r\n')
+            m = ct_re.match(line)
+            if m and last_id is not None:
+                records.append((last_id, m.group(1), m.group(2)))
+            elif line.strip():
+                last_id = line.strip()
+    return records
+
+def chunk_records(records):
+    for i in range(0, len(records), CHUNK_SIZE):
+        yield records[i:i+CHUNK_SIZE], i // CHUNK_SIZE
+
+# === WORKER ===
+def process_chunk(args):
+    chunk, idx, result_list = args
+    lc_keys = {k.lower() for k in KEYWORDS}
+
+    doc = Document()
+    matches_data, seen, with_cust = [], 0, 0
+
+    for identifier, ts, payload in chunk:
+        seen += 1
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+        found = find_keys(obj, lc_keys)
+        if not found:
+            continue
+        with_cust += 1
+
+        para = doc.add_paragraph()
+        para.add_run(clean_xml_string(f"{identifier} | CreateTime:{ts} | "))
+        add_highlighted_payload(para, payload, found)
+
+        para.add_run(" | value: ")
+        for i, (_, val) in enumerate(found):
+            if i:
+                para.add_run(", ")
+            run = para.add_run(clean_xml_string(str(val)))
+            run.font.color.rgb = RGBColor(255, 0, 0)
+
+        para.add_run(" | field: ")
+        for i, (path, _) in enumerate(found):
+            if i:
+                para.add_run(", ")
+            fr = para.add_run(".".join(path))
+            fr.font.color.rgb = RGBColor(255, 0, 0)
+
+        for path, val in found:
+            matches_data.append((identifier, ts, payload, str(val), ".".join(path)))
+
+    if matches_data:
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        doc.save(os.path.join(TEMP_DIR, f"chunk_{idx}.docx"))
+
+    result_list.append((matches_data, seen, with_cust))
+
+# === MERGE & WRITE ===
+def merge_word():
+    merged = Document()
+    for fn in tqdm(sorted(os.listdir(TEMP_DIR)), desc="Merging Word"):
+        if not fn.endswith(".docx"):
+            continue
+        d = Document(os.path.join(TEMP_DIR, fn))
+        for p in d.paragraphs:
+            np = merged.add_paragraph()
+            for r in p.runs:
+                nr = np.add_run(r.text)
+                if r.font.color and r.font.color.rgb:
+                    nr.font.color.rgb = r.font.color.rgb
+                nr.bold, nr.italic, nr.underline = r.bold, r.italic, r.underline
+    merged.save(OUTPUT_DOCX)
+
+def write_excel(all_matches):
+    wb = xlsxwriter.Workbook(OUTPUT_XLSX)
+    ws = wb.add_worksheet()
+    red = wb.add_format({'font_color': 'red'})
+
+    ws.write_row(0, 0, ["Identifier", "Timestamp", "Payload", "CustomerID", "Field"])
+    r = 1
+    for idf, ts, payload, val, field in all_matches:
+        ws.write(r, 0, idf)
+        ws.write(r, 1, ts)
+        ws.write(r, 2, payload)
+        ws.write(r, 3, val, red)
+        ws.write(r, 4, field)
+        r += 1
+    wb.close()
+
+# === MAIN ===
+if __name__ == "__main__":
+    if os.path.isdir(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
+
+    print("=== CUSTOMERID EXTRACTOR w/ INLINE & SUMMARY HIGHLIGHT ===")
+    records = load_records()
+    print(f"Found {len(records)} records.")
+    chunks = list(chunk_records(records))
+
+    mgr = Manager()
+    results = mgr.list()
+    with Pool(min(cpu_count(), len(chunks))) as pool:
+        list(tqdm(
+            pool.imap_unordered(process_chunk, [(chunk, idx, results) for chunk, idx in chunks]),
+            total=len(chunks), desc="Processing"
+        ))
+
+    all_matches, tot, has_cust = [], 0, 0
+    for data, seen, with_cust in results:
+        all_matches.extend(data)
+        tot += seen
+        has_cust += with_cust
+
+    print(f"Records scanned: {tot}, with CustomerID: {has_cust}, matches: {len(all_matches)}")
+
+    if os.path.isdir(TEMP_DIR):
+        merge_word()
+    write_excel(all_matches)
+
+    print(f"\n→ Word: {OUTPUT_DOCX}\n→ Excel: {OUTPUT_XLSX}")
