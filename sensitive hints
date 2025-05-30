@@ -11,8 +11,15 @@ from tqdm import tqdm
 INPUT_FILE      = "input.txt"
 CHUNK_SIZE      = 2000
 KEYWORDS        = [
-    "national id", "identity card", "proof of identity",
-    "document number", "poa", "poi", "proof of address", "doc no"
+    "national id", "national identification number",
+    "natl id", "natl_id",
+    "document number", "doc number",
+    "document id", "document_id",
+    "doc id", "doc_id",
+    "poi", "poa", "id proof", "identity document", "identity no",
+    "identity card", "identification card",
+    "proof of identity", "proof of address",
+    "address proof"
 ]
 OUTPUT_DOCX     = "final_output_sensitivehints.docx"
 OUTPUT_XLSX     = "final_output_sensitivehints.xlsx"
