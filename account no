@@ -11,8 +11,13 @@ from tqdm import tqdm
 INPUT_FILE      = "input.txt"
 CHUNK_SIZE      = 2000
 KEYWORDS        = [
-    "account number", "acc number", "bank account",
-    "account no", "a/c no"
+    "account number", "acc number", "account no", "account_no", "acc_no",
+    "bank account", "bank account number", "acct number", "a/c number", "a/c no",
+    "accountnum", "accountnumbr", "account", "account id",
+    "beneficiary account", "beneficiary account number", "beneficiary acc", "beneficiary acct",
+    "credited to account", "debited from account",
+    "receiving account", "sender account", "payee account", "receiver account",
+    "to account", "from account"
 ]
 OUTPUT_DOCX     = "final_output_accountnumber.docx"
 OUTPUT_XLSX     = "final_output_accountnumber.xlsx"
