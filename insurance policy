@@ -10,7 +10,8 @@ from tqdm import tqdm
 # === CONFIG ===
 INPUT_FILE         = "input.txt"
 CHUNK_SIZE         = 2000
-KEYWORDS           = ["insurance number", "policy number", "insurance id"]
+KEYWORDS           = [    "insurance", "insurance number", "insurance policy", "insurance id", "insuranceid", "insurance no",
+    "policy number", "policy no", "policy id", "policyid", "ins id"]
 OUTPUT_DOCX        = "final_output_insurancepolicy.docx"
 OUTPUT_XLSX        = "final_output_insurancepolicy.xlsx"
 TEMP_DIR           = "temp_parts"
