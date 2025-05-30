@@ -50,11 +50,9 @@ def add_highlighted_payload(para, payload, found):
     low = payload.lower()
     for path, val in found:
         key = path[-1]
-        # find key (case-insensitive)
         i = low.find(key.lower())
         if i != -1:
             intervals.append((i, i+len(key), 'key'))
-        # find value (exact)
         v = str(val)
         j = payload.find(v)
         if j != -1:
@@ -110,13 +108,10 @@ def process_chunk(args):
             continue
         with_addr += 1
 
-        # build paragraph
         para = doc.add_paragraph()
         para.add_run(clean_xml_string(f"{identifier} | CreateTime:{ts} | "))
-        # inline highlight
         add_highlighted_payload(para, payload, found)
 
-        # summary at end
         para.add_run(" | value: ")
         for i, (_, val) in enumerate(found):
             if i: para.add_run(", ")
@@ -129,7 +124,6 @@ def process_chunk(args):
             fr = para.add_run(".".join(path))
             fr.font.color.rgb = RGBColor(255, 0, 0)
 
-        # record for Excel
         for path, val in found:
             matches_data.append((identifier, ts, payload, str(val), ".".join(path)))
 
@@ -158,29 +152,46 @@ def write_excel(all_matches):
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
     ws = wb.add_worksheet()
     red = wb.add_format({'font_color':'red'})
-    ws.write_row(0, 0, ["Identifier","Timestamp","Payload","Address","Field"])
+
+    ws.write_row(0, 0, ["Identifier", "Timestamp", "Payload", "Address", "Field"])
     r = 1
     for idf, ts, payload, val, field in all_matches:
-        ws.write_row(r, 0, [idf, ts, payload, val, field], red)
+        ws.write(r, 0, idf)
+        ws.write(r, 1, ts)
+        ws.write(r, 2, payload)
+        ws.write(r, 3, val, red)      # only Address cell in red
+        ws.write(r, 4, field)
         r += 1
     wb.close()
 
 # === MAIN ===
 if __name__=="__main__":
-    if os.path.isdir(TEMP_DIR): shutil.rmtree(TEMP_DIR)
+    if os.path.isdir(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
+
     print("=== ADDRESS EXTRACTOR w/ INLINE & SUMMARY HIGHLIGHT ===")
     records = load_records()
     print(f"Found {len(records)} records.")
     chunks = list(chunk_records(records))
-    mgr = Manager(); results = mgr.list()
+
+    mgr = Manager()
+    results = mgr.list()
     with Pool(min(cpu_count(), len(chunks))) as pool:
-        list(tqdm(pool.imap_unordered(process_chunk,
-              [(chunk,idx,results) for chunk,idx in chunks]),
-              total=len(chunks), desc="Processing"))
+        list(tqdm(pool.imap_unordered(
+            process_chunk,
+            [(chunk,idx,results) for chunk,idx in chunks]
+        ), total=len(chunks), desc="Processing"))
+
     all_matches, tot, has_addr = [], 0, 0
     for data, seen, with_addr in results:
-        all_matches.extend(data); tot+=seen; has_addr+=with_addr
+        all_matches.extend(data)
+        tot += seen
+        has_addr += with_addr
+
     print(f"Records scanned: {tot}, with Address: {has_addr}, matches: {len(all_matches)}")
-    if os.path.isdir(TEMP_DIR): merge_word()
+
+    if os.path.isdir(TEMP_DIR):
+        merge_word()
     write_excel(all_matches)
+
     print(f"\n→ Word: {OUTPUT_DOCX}\n→ Excel: {OUTPUT_XLSX}")
