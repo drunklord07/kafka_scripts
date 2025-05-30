@@ -31,7 +31,6 @@ def clean_xml_string(s: str) -> str:
 
 # === FIND ALL KEYS MATCHING OUR LIST ===
 def find_keys(obj, keywords, path=None):
-    """Recursively find all occurrences of any key in keywords in obj."""
     if path is None:
         path = []
     matches = []
@@ -39,18 +38,43 @@ def find_keys(obj, keywords, path=None):
         for k, v in obj.items():
             if k.strip().lower() in keywords:
                 matches.append((path + [k], v))
-            # recurse
             matches.extend(find_keys(v, keywords, path + [k]))
     elif isinstance(obj, list):
         for idx, item in enumerate(obj):
             matches.extend(find_keys(item, keywords, path + [str(idx)]))
     return matches
 
-# === PARSE RECORDS BY CreateTime LINES ===
+# === INLINE HIGHLIGHT HELPER ===
+def add_highlighted_payload(para, payload, found):
+    intervals = []
+    low = payload.lower()
+    for path, val in found:
+        key = path[-1]
+        # find key (case-insensitive)
+        i = low.find(key.lower())
+        if i != -1:
+            intervals.append((i, i+len(key), 'key'))
+        # find value (exact)
+        v = str(val)
+        j = payload.find(v)
+        if j != -1:
+            intervals.append((j, j+len(v), 'value'))
+    intervals.sort(key=lambda x: x[0])
+
+    pos = 0
+    for start, end, _ in intervals:
+        if start > pos:
+            para.add_run(clean_xml_string(payload[pos:start]))
+        run = para.add_run(clean_xml_string(payload[start:end]))
+        run.font.color.rgb = RGBColor(255, 0, 0)
+        pos = end
+    if pos < len(payload):
+        para.add_run(clean_xml_string(payload[pos:]))
+
+# === PARSE RECORDS ===
 def load_records():
-    records = []
-    last_id = None
     import re
+    records, last_id = [], None
     ct_re = re.compile(r"^CreateTime:(\d+)\s+(.*)$")
     with open(INPUT_FILE, 'r', encoding='utf-8', errors='ignore') as f:
         for raw in f:
@@ -62,134 +86,101 @@ def load_records():
                 last_id = line.strip()
     return records
 
-# === CHUNKING ===
 def chunk_records(records):
     for i in range(0, len(records), CHUNK_SIZE):
-        yield records[i:i + CHUNK_SIZE], i // CHUNK_SIZE
+        yield records[i:i+CHUNK_SIZE], i//CHUNK_SIZE
 
 # === WORKER ===
 def process_chunk(args):
     chunk, idx, result_list = args
-    lc_keywords = {kw.lower() for kw in KEYWORDS}
+    lc_keys = {k.lower() for k in KEYWORDS}
 
     doc = Document()
-    matches_data = []
-    seen = 0
-    with_addr = 0
+    matches_data, seen, with_addr = [], 0, 0
 
     for identifier, ts, payload in chunk:
         seen += 1
-
         try:
             obj = json.loads(payload)
         except json.JSONDecodeError:
             continue
 
-        found = find_keys(obj, lc_keywords)
+        found = find_keys(obj, lc_keys)
         if not found:
             continue
         with_addr += 1
 
-        # build Word paragraph
-        p = doc.add_paragraph()
-        p.add_run(clean_xml_string(f"{identifier} | CreateTime:{ts} | {payload}"))
+        # build paragraph
+        para = doc.add_paragraph()
+        para.add_run(clean_xml_string(f"{identifier} | CreateTime:{ts} | "))
+        # inline highlight
+        add_highlighted_payload(para, payload, found)
 
-        # highlight values
-        p.add_run(" | value: ")
-        for i, (path, val) in enumerate(found):
-            if i:
-                p.add_run(", ")
-            v = clean_xml_string(str(val))
-            run_val = p.add_run(v)
-            run_val.font.color.rgb = RGBColor(255, 0, 0)
+        # summary at end
+        para.add_run(" | value: ")
+        for i, (_, val) in enumerate(found):
+            if i: para.add_run(", ")
+            run = para.add_run(clean_xml_string(str(val)))
+            run.font.color.rgb = RGBColor(255, 0, 0)
 
-        # highlight field paths
-        p.add_run(" | field: ")
+        para.add_run(" | field: ")
         for i, (path, _) in enumerate(found):
-            if i:
-                p.add_run(", ")
-            fld = ".".join(path)
-            fr = p.add_run(fld)
+            if i: para.add_run(", ")
+            fr = para.add_run(".".join(path))
             fr.font.color.rgb = RGBColor(255, 0, 0)
 
         # record for Excel
         for path, val in found:
             matches_data.append((identifier, ts, payload, str(val), ".".join(path)))
 
-    # save Word chunk
     if matches_data:
         os.makedirs(TEMP_DIR, exist_ok=True)
         doc.save(os.path.join(TEMP_DIR, f"chunk_{idx}.docx"))
 
     result_list.append((matches_data, seen, with_addr))
 
-# === MERGE WORD ===
+# === MERGE & WRITE ===
 def merge_word():
     merged = Document()
     for fn in tqdm(sorted(os.listdir(TEMP_DIR)), desc="Merging Word"):
-        if not fn.endswith(".docx"):
-            continue
+        if not fn.endswith(".docx"): continue
         d = Document(os.path.join(TEMP_DIR, fn))
-        for para in d.paragraphs:
-            p2 = merged.add_paragraph()
-            for run in para.runs:
-                nr = p2.add_run(run.text)
-                if run.font.color and run.font.color.rgb:
-                    nr.font.color.rgb = run.font.color.rgb
-                nr.bold = run.bold
-                nr.italic = run.italic
-                nr.underline = run.underline
+        for p in d.paragraphs:
+            np = merged.add_paragraph()
+            for r in p.runs:
+                nr = np.add_run(r.text)
+                if r.font.color and r.font.color.rgb:
+                    nr.font.color.rgb = r.font.color.rgb
+                nr.bold, nr.italic, nr.underline = r.bold, r.italic, r.underline
     merged.save(OUTPUT_DOCX)
 
-# === WRITE EXCEL ===
 def write_excel(all_matches):
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
     ws = wb.add_worksheet()
-    red = wb.add_format({'font_color': 'red'})
-
-    ws.write_row(0, 0, ["Identifier", "Timestamp", "Payload", "Address", "Field"])
+    red = wb.add_format({'font_color':'red'})
+    ws.write_row(0, 0, ["Identifier","Timestamp","Payload","Address","Field"])
     r = 1
     for idf, ts, payload, val, field in all_matches:
-        ws.write(r, 0, idf)
-        ws.write(r, 1, ts)
-        ws.write(r, 2, payload)
-        ws.write(r, 3, val, red)
-        ws.write(r, 4, field)
+        ws.write_row(r, 0, [idf, ts, payload, val, field], red)
         r += 1
     wb.close()
 
 # === MAIN ===
-if __name__ == "__main__":
-    if os.path.isdir(TEMP_DIR):
-        shutil.rmtree(TEMP_DIR)
-
-    print("=== ADDRESS EXTRACTOR w/ FIELD NAMES ===")
+if __name__=="__main__":
+    if os.path.isdir(TEMP_DIR): shutil.rmtree(TEMP_DIR)
+    print("=== ADDRESS EXTRACTOR w/ INLINE & SUMMARY HIGHLIGHT ===")
     records = load_records()
     print(f"Found {len(records)} records.")
     chunks = list(chunk_records(records))
-
-    mgr = Manager()
-    results = mgr.list()
-
+    mgr = Manager(); results = mgr.list()
     with Pool(min(cpu_count(), len(chunks))) as pool:
-        list(tqdm(pool.imap_unordered(
-            process_chunk,
-            [(chunk, idx, results) for chunk, idx in chunks]
-        ), total=len(chunks), desc="Processing"))
-
-    # aggregate
-    all_matches = []
-    tot = has_addr = 0
+        list(tqdm(pool.imap_unordered(process_chunk,
+              [(chunk,idx,results) for chunk,idx in chunks]),
+              total=len(chunks), desc="Processing"))
+    all_matches, tot, has_addr = [], 0, 0
     for data, seen, with_addr in results:
-        all_matches.extend(data)
-        tot += seen
-        has_addr += with_addr
-
+        all_matches.extend(data); tot+=seen; has_addr+=with_addr
     print(f"Records scanned: {tot}, with Address: {has_addr}, matches: {len(all_matches)}")
-
-    if os.path.isdir(TEMP_DIR):
-        merge_word()
+    if os.path.isdir(TEMP_DIR): merge_word()
     write_excel(all_matches)
-
-    print(f"\n→ Word: {OUTPUT_DOCX}")
-    print(f"→ Excel: {OUTPUT_XLSX}")
+    print(f"\n→ Word: {OUTPUT_DOCX}\n→ Excel: {OUTPUT_XLSX}")
