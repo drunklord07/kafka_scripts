@@ -11,10 +11,16 @@ from tqdm import tqdm
 INPUT_FILE   = "input.txt"
 CHUNK_SIZE   = 2000
 KEYWORDS     = [
-    "address", "full address", "complete address",
-    "residential address", "permanent address",
-    "locality", "pincode", "postal code", "zip",
-    "zip code", "city", "state"
+    "address", "full address", "complete address", "residential address", "permanent address",
+    "current address", "correspondence address", "present address", "mailing address",
+    "billing address", "shipping address", "registered address", "home address",
+    "office address", "work address", "business address", "shop address", "delivery address", "native address",
+    "house no", "building name", "flat no", "apartment", "door number", "plot no", "block",
+    "floor", "tower", "unit number", "address line1", "address line2", "street", "street name",
+    "road", "lane", "area", "locality", "colony", "sector", "village", "district",
+    "taluk", "mandal", "tehsil", "municipality", "town", "city", "state", "region",
+    "zone", "division", "province", "pincode", "pin", "postal code", "zip", "zip code",
+    "location", "geo location", "place", "addr", "addr1", "addr2"
 ]
 OUTPUT_DOCX  = "final_output_address.docx"
 OUTPUT_XLSX  = "final_output_address.xlsx"
