@@ -10,7 +10,8 @@ from tqdm import tqdm
 # === CONFIG ===
 INPUT_FILE   = "input.txt"
 CHUNK_SIZE   = 2000
-KEYWORDS     = ["date of birth", "dob", "birthdate", "born on"]
+KEYWORDS     = [    "dob", "date of birth", "birth date", "d.o.b", "birthdate", "dateofbirth",
+    "birth day", "birth", "born on"]
 OUTPUT_DOCX  = "final_output_dob.docx"
 OUTPUT_XLSX  = "final_output_dob.xlsx"
 TEMP_DIR     = "temp_parts"
