@@ -10,7 +10,9 @@ from tqdm import tqdm
 # === CONFIG ===
 INPUT_FILE      = "input.txt"
 CHUNK_SIZE      = 2000
-KEYWORDS        = ["customer id", "cust id", "customer number"]
+KEYWORDS        = [    "customer id", "cust id", "customerid", "custid",
+    "customer number", "cust number", "customer no", "cust no",
+    "customeridnumber", "custidnumber"]
 OUTPUT_DOCX     = "final_output_customerid.docx"
 OUTPUT_XLSX     = "final_output_customerid.xlsx"
 TEMP_DIR        = "temp_parts"
