@@ -1,0 +1,10 @@
+keyword_groups = {
+    "Address": ["address", "full address", "complete address", "residential address", "permanent address",
+                "locality", "pincode", "postal code", "zip", "zip code", "city", "state"],
+    "Name": ["name"],
+    "DOB": ["date of birth", "dob", "birthdate", "born on"],
+    "AccountNumber": ["account number", "acc number", "bank account", "account no", "a/c no"],
+    "CustomerID": ["customer id", "cust id", "customer number"],
+    "SensitiveHints": ["national id", "identity card", "proof of identity", "document number"],
+    "InsurancePolicy": ["insurance number", "policy number", "insurance id"]
+}
