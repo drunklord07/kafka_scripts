@@ -11,11 +11,24 @@ from tqdm import tqdm
 # === CONFIG ===
 INPUT_FILE   = "input.txt"
 CHUNK_SIZE   = 2000
-# must be preceded/followed only by JSON separators, whitespace, or start/end
-MOBILE_REGEX = r'(?<=[\s\[\]\{\},":\']|^)(?:\+91[\-\s]?|91[\-\s]?|0)?[6-9]\d{9}(?=[\s\[\]\{\},":\']|$)'
-KV_BODY      = r'(?:\+91[\-\s]?|91[\-\s]?|0)?[6-9]\d{9}'
-KV_RE        = re.compile(r'"([^"]+)"\s*:\s*"' + KV_BODY + r'"|'
-                          r'"([^"]+)"\s*:\s*(' + KV_BODY + r')(?=[\s,}\]]|$)')
+
+# Build a reusable 10-digit mobile body (optional +91/91/0 prefix)
+MOBILE_BODY  = r'(?:\+91[\-\s]?|91[\-\s]?|0)?[6-9]\d{9}'
+
+# Only match if preceded by start-of-string or a JSON delimiter/whitespace,
+# and followed by a JSON delimiter/whitespace or end-of-string
+MOBILE_REGEX = (
+    rf'(?:^|(?<=[\s\[\]\{{\}},":\']))'
+    rf'({MOBILE_BODY})'
+    rf'(?=[\s\[\]\{{\}},":\']|$)'
+)
+
+# Generic key:value regex (handles "key":"value" and "key":value)
+KV_RE        = re.compile(
+    rf'"([^"]+)"\s*:\s*"(?:{MOBILE_BODY})"|'     # quoted value
+    rf'"([^"]+)"\s*:\s*({MOBILE_BODY})(?=[\s,}}\\]]|$)'  # unquoted
+)
+
 OUTPUT_DOCX  = "final_output_mobile_strict.docx"
 OUTPUT_XLSX  = "final_output_mobile_strict.xlsx"
 TEMP_DIR     = "temp_parts"
@@ -92,7 +105,7 @@ def process_chunk(args):
             continue
         recs_with_mobile += 1
 
-        # 1) flatten real JSON
+        # 1) flatten JSON for exact matches
         flat = {}
         try:
             obj = json.loads(raw)
@@ -109,30 +122,26 @@ def process_chunk(args):
         fields = []
 
         for m in hits:
-            s, e = m.span()
-            mobile = m.group()
-            # highlight in Word
+            s, e = m.span(1)
             if s > last:
                 para.add_run(raw[last:s])
+            mobile = m.group(1)
             run = para.add_run(mobile)
             run.font.color.rgb = RGBColor(255, 0, 0)
             last = e
 
-            # lookup field in flattened JSON (exact match or substring)
+            # 1st try: exact or substring match in flattened JSON
             field = ""
             for path, val in flat.items():
                 if str(val) == mobile or (isinstance(val, str) and mobile in val):
                     field = path
                     break
 
-            # fallback: generic key:value
+            # fallback: generic key:value regex
             if not field:
-                for grp in KV_RE.findall(raw_unesc):
-                    key = grp[0] or grp[1]
-                    val = grp[2] or (grp[0] and grp[1]) or ""
-                    if val == mobile:
-                        field = key
-                        break
+                fm = KV_RE.search(raw_unesc)
+                if fm:
+                    field = fm.group(1) or fm.group(2)
 
             fields.append(field)
             matches_data.append((identifier, ts, raw, mobile, field))
@@ -148,7 +157,7 @@ def process_chunk(args):
             fr = para.add_run(fld)
             fr.font.color.rgb = RGBColor(255, 0, 0)
 
-    # save this chunk if any matches
+    # save chunk if matches found
     if matches_data:
         os.makedirs(TEMP_DIR, exist_ok=True)
         doc.save(os.path.join(TEMP_DIR, f"chunk_{idx}.docx"))
@@ -163,9 +172,9 @@ def merge_word():
             continue
         sub = Document(os.path.join(TEMP_DIR, fn))
         for para in sub.paragraphs:
-            out = merged.add_paragraph()
+            out_p = merged.add_paragraph()
             for run in para.runs:
-                nr = out.add_run(run.text)
+                nr = out_p.add_run(run.text)
                 if run.font.color and run.font.color.rgb:
                     nr.font.color.rgb = run.font.color.rgb
                 nr.bold, nr.italic, nr.underline = run.bold, run.italic, run.underline
@@ -192,7 +201,7 @@ if __name__=="__main__":
     if os.path.isdir(TEMP_DIR):
         shutil.rmtree(TEMP_DIR)
 
-    print("=== MOBILE EXTRACTOR (Strict + Robust Field-Lookup) ===")
+    print("=== MOBILE EXTRACTOR (Fixed Lookbehind + Field Lookup) ===")
     records = load_records()
     print(f"Total records: {len(records)}")
     chunks = list(chunk_records(records))
