@@ -24,14 +24,15 @@ def clean_xml_string(s: str) -> str:
         or (0xE000 <= ord(ch) <= 0xFFFD)
     )
 
-# === FIND ALL KEYS MATCHING OUR LIST ===
+# === FIND ALL KEYS CONTAINING ANY KEYWORD SUBSTRING ===
 def find_keys(obj, keywords, path=None):
     if path is None:
         path = []
     matches = []
     if isinstance(obj, dict):
         for k, v in obj.items():
-            if k.strip().lower() in keywords:
+            lowkey = k.strip().lower()
+            if any(kw in lowkey for kw in keywords):
                 matches.append((path + [k], v))
             matches.extend(find_keys(v, keywords, path + [k]))
     elif isinstance(obj, list):
@@ -47,15 +48,15 @@ def add_highlighted_payload(para, payload, found):
         key = path[-1]
         i = low.find(key.lower())
         if i != -1:
-            intervals.append((i, i+len(key), 'key'))
+            intervals.append((i, i + len(key)))
         v = str(val)
         j = payload.find(v)
         if j != -1:
-            intervals.append((j, j+len(v), 'value'))
+            intervals.append((j, j + len(v)))
     intervals.sort(key=lambda x: x[0])
 
     pos = 0
-    for start, end, _ in intervals:
+    for start, end in intervals:
         if start > pos:
             para.add_run(clean_xml_string(payload[pos:start]))
         run = para.add_run(clean_xml_string(payload[start:end]))
@@ -81,7 +82,7 @@ def load_records():
 
 def chunk_records(records):
     for i in range(0, len(records), CHUNK_SIZE):
-        yield records[i:i+CHUNK_SIZE], i//CHUNK_SIZE
+        yield records[i:i+CHUNK_SIZE], i // CHUNK_SIZE
 
 # === WORKER ===
 def process_chunk(args):
@@ -109,13 +110,15 @@ def process_chunk(args):
 
         para.add_run(" | value: ")
         for i, (_, val) in enumerate(found):
-            if i: para.add_run(", ")
+            if i:
+                para.add_run(", ")
             run = para.add_run(clean_xml_string(str(val)))
             run.font.color.rgb = RGBColor(255, 0, 0)
 
         para.add_run(" | field: ")
         for i, (path, _) in enumerate(found):
-            if i: para.add_run(", ")
+            if i:
+                para.add_run(", ")
             fr = para.add_run(".".join(path))
             fr.font.color.rgb = RGBColor(255, 0, 0)
 
@@ -132,7 +135,8 @@ def process_chunk(args):
 def merge_word():
     merged = Document()
     for fn in tqdm(sorted(os.listdir(TEMP_DIR)), desc="Merging Word"):
-        if not fn.endswith(".docx"): continue
+        if not fn.endswith(".docx"):
+            continue
         d = Document(os.path.join(TEMP_DIR, fn))
         for p in d.paragraphs:
             np = merged.add_paragraph()
@@ -154,17 +158,17 @@ def write_excel(all_matches):
         ws.write(r, 0, idf)
         ws.write(r, 1, ts)
         ws.write(r, 2, payload)
-        ws.write(r, 3, val, red)      # only Name cell in red
+        ws.write(r, 3, val, red)
         ws.write(r, 4, field)
         r += 1
     wb.close()
 
 # === MAIN ===
-if __name__=="__main__":
+if __name__ == "__main__":
     if os.path.isdir(TEMP_DIR):
         shutil.rmtree(TEMP_DIR)
 
-    print("=== NAME EXTRACTOR w/ INLINE & SUMMARY HIGHLIGHT ===")
+    print("=== NAME EXTRACTOR w/ INLINE & SUMMARY HIGHLIGHT (SUBSTRING MATCH) ===")
     records = load_records()
     print(f"Found {len(records)} records.")
     chunks = list(chunk_records(records))
@@ -174,7 +178,7 @@ if __name__=="__main__":
     with Pool(min(cpu_count(), len(chunks))) as pool:
         list(tqdm(pool.imap_unordered(
             process_chunk,
-            [(chunk,idx,results) for chunk,idx in chunks]
+            [(chunk, idx, results) for chunk, idx in chunks]
         ), total=len(chunks), desc="Processing"))
 
     all_matches, tot, has_name = [], 0, 0
@@ -183,7 +187,7 @@ if __name__=="__main__":
         tot += seen
         has_name += with_name
 
-    print(f"Records scanned: {tot}, with Name: {has_name}, matches: {len(all_matches)}")
+    print(f"Records scanned: {tot}, with Name matches: {has_name}, total matches: {len(all_matches)}")
 
     if os.path.isdir(TEMP_DIR):
         merge_word()
