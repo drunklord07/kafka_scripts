@@ -1,0 +1,223 @@
+import os
+import re
+import json
+import shutil
+from multiprocessing import Pool, Manager, cpu_count
+from docx import Document
+from docx.shared import RGBColor
+import xlsxwriter
+from tqdm import tqdm
+
+# === CONFIG ===
+INPUT_FILE     = "input.txt"
+CHUNK_SIZE     = 2000
+
+# Core 10-digit body (starts 6–9), with optional +91/91/0 prefix
+# Ensure no other digit immediately before or after, but allow letters/@/._>,-_
+MOBILE_REGEX   = r'(?<!\d)((?:\+91[\-\s]?|91[\-\s]?|0)?[6-9]\d{9})(?!\d)'
+
+# Body for generic key:value regex (no lookarounds here)
+KV_BODY        = r'(?:\+91[\-\s]?|91[\-\s]?|0)?[6-9]\d{9}'
+
+# Exact-match generic key:value matcher: "key":<mobile> followed by space, comma, brace, bracket or EOL
+KV_EXACT_RE    = re.compile(
+    rf'"([^"]+)"\s*:\s*("(?:{KV_BODY})"|(?:{KV_BODY}))(?=[\s,}}\]]|$)'
+)
+
+OUTPUT_DOCX    = "june4_test5.docx"
+OUTPUT_XLSX    = "june4_test5.xlsx"
+TEMP_DIR       = "temp_parts"
+
+# === UTILITIES ===
+def clean_text(s: str) -> str:
+    return s.replace('\x00', '')
+
+def flatten_json(obj, prefix=""):
+    """ Recursively flatten dict/list and parse JSON-in-strings. """
+    flat = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            path = f"{prefix}{k}"
+            if isinstance(v, (dict, list)):
+                flat.update(flatten_json(v, path + "."))
+            elif isinstance(v, str) and v.strip().startswith(("{", "[")):
+                try:
+                    inner = json.loads(v)
+                except:
+                    flat[path] = v
+                else:
+                    flat.update(flatten_json(inner, path + "."))
+            else:
+                flat[path] = v
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            flat.update(flatten_json(item, f"{prefix}[{i}]."))
+    return flat
+
+# === LOAD & GROUP RECORDS ===
+def load_records():
+    records = []
+    last_id = None
+    ct_re    = re.compile(r"^CreateTime:(\d+)\s+(.*)$")
+    with open(INPUT_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+        for raw in f:
+            line = raw.rstrip('\r\n')
+            m = ct_re.match(line)
+            if m and last_id is not None:
+                ts      = m.group(1)
+                payload = clean_text(m.group(2))
+                records.append((last_id, ts, payload))
+            elif line.strip():
+                last_id = line.strip()
+    return records
+
+# === SPLIT INTO CHUNKS ===
+def chunk_records(records):
+    for i in range(0, len(records), CHUNK_SIZE):
+        yield records[i:i+CHUNK_SIZE], i // CHUNK_SIZE
+
+# === PROCESS ONE CHUNK ===
+def process_chunk(args):
+    chunk, idx, result_list = args
+    pat_mobile = re.compile(MOBILE_REGEX)
+    doc = Document()
+    matches_data = []
+    recs_seen = recs_with_mobile = 0
+
+    for identifier, ts, payload in chunk:
+        recs_seen += 1
+        raw = clean_text(payload)
+        hits = list(pat_mobile.finditer(raw))
+        if not hits:
+            continue
+        recs_with_mobile += 1
+
+        # 1) try well-formed JSON flatten
+        flat = {}
+        try:
+            obj = json.loads(raw)
+            flat = flatten_json(obj)
+        except json.JSONDecodeError:
+            pass
+
+        # 2) prepare unescaped fallback text
+        raw_unesc = raw.replace('\\"', '"').replace('\\{', '{').replace('\\}', '}')
+
+        # start Word paragraph
+        para = doc.add_paragraph(f"{identifier} | CreateTime:{ts} | ")
+        last = 0
+        fields = []
+
+        for m in hits:
+            s, e = m.span(1)
+            if s > last:
+                para.add_run(raw[last:s])
+            mobile = m.group(1)
+            run = para.add_run(mobile)
+            run.font.color.rgb = RGBColor(255, 0, 0)
+            last = e
+
+            # lookup field: exact match in JSON flatten
+            field = next((k for k, v in flat.items() if str(v) == mobile), "")
+
+            # fallback: exact "key":mobile or "key":"mobile"
+            if not field:
+                fm = KV_EXACT_RE.search(raw_unesc)
+                if fm and mobile in fm.group(2):
+                    field = fm.group(1)
+
+            # fallback 2: look for any "key": "<...mobile...>"
+            if not field:
+                pattern_contains = re.compile(
+                    rf'"([^"]+)"\s*:\s*"[^"]*{re.escape(mobile)}[^"]*"'
+                )
+                fm2 = pattern_contains.search(raw_unesc)
+                if fm2:
+                    field = fm2.group(1)
+
+            fields.append(field)
+            matches_data.append((identifier, ts, raw, mobile, field))
+
+        if last < len(raw):
+            para.add_run(raw[last:])
+
+        # append field names
+        para.add_run(" | field: ")
+        for i, fld in enumerate(fields):
+            if i:
+                para.add_run(", ")
+            fr = para.add_run(fld)
+            fr.font.color.rgb = RGBColor(255, 0, 0)
+
+    # save Word chunk if matches
+    if matches_data:
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        doc.save(os.path.join(TEMP_DIR, f"chunk_{idx}.docx"))
+
+    result_list.append((matches_data, recs_seen, recs_with_mobile))
+
+# === MERGE WORD CHUNKS ===
+def merge_word():
+    merged = Document()
+    for fn in tqdm(sorted(os.listdir(TEMP_DIR)), desc="Merging Word"):
+        if not fn.endswith(".docx"):
+            continue
+        sub = Document(os.path.join(TEMP_DIR, fn))
+        for para in sub.paragraphs:
+            out_p = merged.add_paragraph()
+            for run in para.runs:
+                nr = out_p.add_run(run.text)
+                if run.font.color and run.font.color.rgb:
+                    nr.font.color.rgb = run.font.color.rgb
+                nr.bold, nr.italic, nr.underline = run.bold, run.italic, run.underline
+    merged.save(OUTPUT_DOCX)
+
+# === WRITE EXCEL ===
+def write_excel(all_matches):
+    wb = xlsxwriter.Workbook(OUTPUT_XLSX)
+    ws = wb.add_worksheet()
+    red = wb.add_format({'font_color':'red'})
+    ws.write_row(0, 0, ["Identifier","Timestamp","Payload","Mobile","Field"])
+    row = 1
+    for ident, ts, payload, mobile, field in all_matches:
+        ws.write(row, 0, ident)
+        ws.write(row, 1, ts)
+        ws.write(row, 2, payload)
+        ws.write(row, 3, mobile, red)
+        ws.write(row, 4, field)
+        row += 1
+    wb.close()
+
+# === MAIN ===
+if __name__ == "__main__":
+    if os.path.isdir(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
+
+    print("=== MOBILE EXTRACTOR (Allow @, letters, . > , - _ around numbers) ===")
+    records = load_records()
+    print(f"Total records: {len(records)}")
+    chunks = list(chunk_records(records))
+
+    mgr = Manager()
+    results = mgr.list()
+    with Pool(min(cpu_count(), len(chunks))) as pool:
+        list(tqdm(pool.imap_unordered(
+            process_chunk,
+            [(chunk, idx, results) for chunk, idx in chunks]
+        ), total=len(chunks), desc="Processing chunks"))
+
+    all_matches = []
+    tot = has = 0
+    for data, recs, with_mobile in results:
+        all_matches.extend(data)
+        tot += recs
+        has += with_mobile
+
+    print(f"Records scanned: {tot}, with mobile: {has}, matches: {len(all_matches)}")
+
+    if os.path.isdir(TEMP_DIR):
+        merge_word()
+    write_excel(all_matches)
+    shutil.rmtree(TEMP_DIR)
+
+    print(f"\n→ Word saved to {OUTPUT_DOCX}\n→ Excel saved to {OUTPUT_XLSX}")
