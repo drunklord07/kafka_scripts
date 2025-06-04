@@ -1,0 +1,246 @@
+import os
+import re
+import json
+import shutil
+from multiprocessing import Pool, Manager, cpu_count
+from docx import Document
+from docx.shared import RGBColor
+import xlsxwriter
+from tqdm import tqdm
+
+# === CONFIG ===
+INPUT_FILE     = "input.txt"
+CHUNK_SIZE     = 2000
+
+# Combined Visa, MasterCard, Amex (exact) with word boundaries
+CARD_REGEX     = r'\b((?:' \
+                 r'4[0-9]{12}(?:[0-9]{3})?' \
+                 r'|' \
+                 r'5[1-5][0-9]{14}' \
+                 r'|' \
+                 r'2(?:2[2-9][0-9]{12}|[3-6][0-9]{13}|7(?:[01][0-9]{12}|20[0-9]{12}))' \
+                 r'|' \
+                 r'3[47][0-9]{13}' \
+                 r'))\b'
+# Extract just the numeric part for JSON fallback
+CARD_BODY      = r'(?:' \
+                 r'4[0-9]{12}(?:[0-9]{3})?' \
+                 r'|' \
+                 r'5[1-5][0-9]{14}' \
+                 r'|' \
+                 r'2(?:2[2-9][0-9]{12}|[3-6][0-9]{13}|7(?:[01][0-9]{12}|20[0-9]{12}))' \
+                 r'|' \
+                 r'3[47][0-9]{13}' \
+                 r')'
+
+# Exact-match JSON:
+#   "key":"CARD" or "key":"[CARD]" possibly followed by a dot,
+#   or unquoted "key":CARD or "key":[CARD] with dot or closing bracket/punctuation.
+KV_EXACT_RE    = re.compile(
+    rf'"([^"]+)"\s*:\s*"\[?({CARD_BODY})\]?"(?:\.)?|'    # "key":"[number]" or "key":"number"+optional dot
+    rf'"([^"]+)"\s*:\s*\[?({CARD_BODY})\]?(?=[\s,}}\]\.]|$)'   # "key":[number] or "key":number + lookahead
+)
+
+OUTPUT_DOCX    = "final_output_card.docx"
+OUTPUT_XLSX    = "final_output_card.xlsx"
+TEMP_DIR       = "temp_parts"
+
+# === UTILITIES ===
+def clean_text(s: str) -> str:
+    return s.replace('\x00', '')
+
+def flatten_json(obj, prefix=""):
+    """ Recursively flatten dicts and lists; parse JSON-in-strings. """
+    flat = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            path = f"{prefix}{k}"
+            if isinstance(v, (dict, list)):
+                flat.update(flatten_json(v, path + "."))
+            elif isinstance(v, str) and v.strip().startswith(("{", "[")):
+                try:
+                    inner = json.loads(v)
+                except:
+                    flat[path] = v
+                else:
+                    flat.update(flatten_json(inner, path + "."))
+            else:
+                flat[path] = v
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            flat.update(flatten_json(item, f"{prefix}[{i}]."))
+    return flat
+
+# === LOAD & GROUP RECORDS ===
+def load_records():
+    records = []
+    last_id = None
+    ct_re    = re.compile(r"^CreateTime:(\d+)\s+(.*)$")
+    with open(INPUT_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+        for raw in f:
+            line = raw.rstrip('\r\n')
+            m = ct_re.match(line)
+            if m and last_id is not None:
+                ts      = m.group(1)
+                payload = clean_text(m.group(2))
+                records.append((last_id, ts, payload))
+            elif line.strip():
+                last_id = line.strip()
+    return records
+
+# === SPLIT INTO CHUNKS ===
+def chunk_records(records):
+    for i in range(0, len(records), CHUNK_SIZE):
+        yield records[i:i+CHUNK_SIZE], i // CHUNK_SIZE
+
+# === PROCESS ONE CHUNK ===
+def process_chunk(args):
+    chunk, idx, result_list = args
+    pat_card = re.compile(CARD_REGEX)
+    doc = Document()
+    matches_data = []
+    recs_seen = recs_with_card = 0
+
+    for identifier, ts, payload in chunk:
+        recs_seen += 1
+        raw = clean_text(payload)
+        hits = list(pat_card.finditer(raw))
+        if not hits:
+            continue
+        recs_with_card += 1
+
+        # 1) Try flattening JSON
+        flat = {}
+        try:
+            obj = json.loads(raw)
+            flat = flatten_json(obj)
+        except json.JSONDecodeError:
+            pass
+
+        # 2) Prepare unescaped text for fallback regex
+        raw_unesc = raw.replace('\\"', '"').replace('\\{', '{').replace('\\}', '}')
+
+        # Start Word paragraph
+        para = doc.add_paragraph(f"{identifier} | CreateTime:{ts} | ")
+        last = 0
+        fields = []
+
+        for m in hits:
+            s, e = m.span(1)
+            if s > last:
+                para.add_run(raw[last:s])
+            card_num = m.group(1)
+            run = para.add_run(card_num)
+            run.font.color.rgb = RGBColor(255, 0, 0)
+            last = e
+
+            # --- Field lookup ---
+            field = ""
+
+            # a) Exact match in flattened JSON
+            for path, val in flat.items():
+                if str(val) == card_num or (isinstance(val, str) and card_num in val):
+                    field = path
+                    break
+
+            # b) Exact JSON key:value or key:[value] possibly ending with .
+            if not field:
+                fm = KV_EXACT_RE.search(raw_unesc)
+                if fm:
+                    field = fm.group(1) or fm.group(3)
+
+            # c) Contains-match: key where value contains card_num
+            if not field:
+                patt_contains = re.compile(
+                    rf'"([^"]+)"\s*:\s*"\[?[^"]*{re.escape(card_num)}[^"]*\]?"'
+                )
+                fm2 = patt_contains.search(raw_unesc)
+                if fm2:
+                    field = fm2.group(1)
+
+            fields.append(field)
+            matches_data.append((identifier, ts, raw, card_num, field))
+
+        if last < len(raw):
+            para.add_run(raw[last:])
+
+        # Append field names in red
+        para.add_run(" | field: ")
+        for i, fld in enumerate(fields):
+            if i:
+                para.add_run(", ")
+            fr = para.add_run(fld)
+            fr.font.color.rgb = RGBColor(255, 0, 0)
+
+    # Save Word chunk if matches found
+    if matches_data:
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        doc.save(os.path.join(TEMP_DIR, f"chunk_{idx}.docx"))
+
+    result_list.append((matches_data, recs_seen, recs_with_card))
+
+# === MERGE WORD CHUNKS ===
+def merge_word():
+    merged = Document()
+    for fn in tqdm(sorted(os.listdir(TEMP_DIR)), desc="Merging Word"):
+        if not fn.endswith(".docx"):
+            continue
+        sub = Document(os.path.join(TEMP_DIR, fn))
+        for para in sub.paragraphs:
+            out_p = merged.add_paragraph()
+            for run in para.runs:
+                nr = out_p.add_run(run.text)
+                if run.font.color and run.font.color.rgb:
+                    nr.font.color.rgb = run.font.color.rgb
+                nr.bold, nr.italic, nr.underline = run.bold, run.italic, run.underline
+    merged.save(OUTPUT_DOCX)
+
+# === WRITE EXCEL ===
+def write_excel(all_matches):
+    wb = xlsxwriter.Workbook(OUTPUT_XLSX)
+    ws = wb.add_worksheet()
+    red = wb.add_format({'font_color':'red'})
+    ws.write_row(0, 0, ["Identifier","Timestamp","Payload","CardNumber","Field"])
+    row = 1
+    for ident, ts, payload, card_num, field in all_matches:
+        ws.write(row, 0, ident)
+        ws.write(row, 1, ts)
+        ws.write(row, 2, payload)
+        ws.write(row, 3, card_num, red)
+        ws.write(row, 4, field)
+        row += 1
+    wb.close()
+
+# === MAIN ===
+if __name__ == "__main__":
+    if os.path.isdir(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
+
+    print("=== CARD EXTRACTOR (Visa, MasterCard, Amex + Field Lookup) ===")
+    records = load_records()
+    print(f"Total records: {len(records)}")
+    chunks = list(chunk_records(records))
+
+    mgr = Manager()
+    results = mgr.list()
+    with Pool(min(cpu_count(), len(chunks))) as pool:
+        list(tqdm(pool.imap_unordered(
+            process_chunk,
+            [(chunk, idx, results) for chunk, idx in chunks]
+        ), total=len(chunks), desc="Processing chunks"))
+
+    all_matches = []
+    tot = has = 0
+    for data, recs, with_card in results:
+        all_matches.extend(data)
+        tot += recs
+        has += with_card
+
+    print(f"Records scanned: {tot}, with card: {has}, matches: {len(all_matches)}")
+
+    if os.path.isdir(TEMP_DIR):
+        merge_word()
+    write_excel(all_matches)
+    shutil.rmtree(TEMP_DIR)
+
+    print(f"\n→ Word saved to {OUTPUT_DOCX}\n→ Excel saved to {OUTPUT_XLSX}")
