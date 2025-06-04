@@ -9,50 +9,69 @@ import xlsxwriter
 from tqdm import tqdm
 
 # === CONFIG ===
-INPUT_FILE     = "input.txt"
-CHUNK_SIZE     = 2000
+INPUT_FILE       = "input.txt"
+CHUNK_SIZE       = 2000
 
-# Core 10-digit mobile body (starts 6–9), with optional +91, 91, or 0 prefix
-MOBILE_BODY    = r'(?:\+91[\-\s]?|91|0)?[6-9]\d{9}'
+# Core 10-digit body (starts 6–9), with optional +91, 91, or 0 prefix
+MOBILE_BODY      = r'(?:\+91[\-\s]?|91|0)?[6-9]\d{9}'
 
-# Only match when preceded/followed by JSON delimiters, whitespace, or start/end
-MOBILE_REGEX   = (
+# Only match if preceded/followed by JSON delimiters, whitespace, or start/end
+MOBILE_REGEX     = (
     rf'(?:^|(?<=[\s\[\]\{{\}},":\']))'
     rf'({MOBILE_BODY})'
     rf'(?=[\s\[\]\{{\}},":\']|$)'
 )
 
-# Broad pattern to detect any 10-digit sequence (for error logging)
-BROAD_REGEX    = re.compile(MOBILE_BODY)
-
-# XML tag regex (quoted or unquoted value attributes)
-XML_RE         = re.compile(
-    rf'<(?:tagname|name)\s*=\s*"mobile"\s+value\s*=\s*"?({MOBILE_BODY})"?'
+# BROAD pattern: same ten‐digit core but ensured NOT surrounded by any other digit
+BROAD_REGEX      = re.compile(
+    rf'(?<!\d)(?:{MOBILE_BODY})(?!\d)'
 )
-# Fallback for direct mobile="..." attributes in XML
-XML_ATTR_RE    = re.compile(rf'mobile\s*=\s*"({MOBILE_BODY})"')
+
+# Generic key:value regex for JSON (quoted or unquoted)
+KV_RE             = re.compile(
+    rf'"([^"]+)"\s*:\s*"(?:{MOBILE_BODY})"|'       # "key":"<mobile>"
+    rf'"([^"]+)"\s*:\s*({MOBILE_BODY})(?=[\s,}}\\]]|$)'  # "key":<mobile>
+)
+
+# XML tag regex for dynamic key names (phone/mobile/customer/cust/contact),
+# quoted or unquoted value = <mobile>
+XML_RE            = re.compile(
+    rf'<(?:tagname|name)\s*=\s*"(?:(?:phone|mobile|customer|cust|contact))"\s+value\s*=\s*"?({MOBILE_BODY})"?',
+    flags=re.IGNORECASE
+)
+# Fallback: any mobile="..."
+XML_ATTR_RE       = re.compile(
+    rf'mobile\s*=\s*"?({MOBILE_BODY})"?',
+    flags=re.IGNORECASE
+)
 
 # Nested-JSON "name":"mobile","value":... (quoted or unquoted)
-NESTED_JSON_RE = re.compile(
-    rf'"name"\s*:\s*"mobile"\s*,\s*"value"\s*:\s*"?({MOBILE_BODY})"?'
+NESTED_JSON_RE    = re.compile(
+    rf'"name"\s*:\s*"(?:(?:phone|mobile|customer|cust|contact))"\s*,\s*"value"\s*:\s*"?({MOBILE_BODY})"?',
+    flags=re.IGNORECASE
 )
 
-# Generic key:value JSON regex
-KV_RE          = re.compile(
-    rf'"([^"]+)"\s*:\s*"(?:{MOBILE_BODY})"|'     # quoted
-    rf'"([^"]+)"\s*:\s*({MOBILE_BODY})(?=[\s,}}\\]]|$)'  # unquoted
+# Dynamic fallback: any key containing phone/mobile/customer/cust/contact in JSON
+KEYWORD_MOBILE_RE = re.compile(
+    rf'"([^"]*(?:phone|mobile|customer|cust|contact)[^"]*)"\s*[:=]\s*"?({MOBILE_BODY})"?',
+    flags=re.IGNORECASE
 )
 
-OUTPUT_DOCX    = "final_output_mobile_strict.docx"
-OUTPUT_XLSX    = "final_output_mobile_strict.xlsx"
-ERROR_LINES_TXT= "error_lines.txt"
-TEMP_DIR       = "temp_parts"
+OUTPUT_DOCX       = "final_output_mobile_dynamic.docx"
+OUTPUT_XLSX       = "final_output_mobile_dynamic.xlsx"
+ERROR_LINES_TXT   = "error_lines.txt"
+TEMP_DIR          = "temp_parts"
 
 # === UTILITIES ===
 def clean_text(s: str) -> str:
+    # Remove null bytes which can break Word/XML
     return s.replace('\x00', '')
 
 def flatten_json(obj, prefix=""):
+    """
+    Recursively flatten a dict or list. If a string value itself is JSON,
+    parse and flatten that too. Primitives in lists recorded as key[index].
+    """
     flat = {}
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -84,6 +103,10 @@ def flatten_json(obj, prefix=""):
 
 # === LOAD & GROUP RECORDS ===
 def load_records():
+    """
+    Reads INPUT_FILE. Lines not starting with CreateTime are identifiers.
+    Lines like "CreateTime:<ts> <payload>" pair with the previous identifier.
+    """
     records = []
     last_id = None
     ct_re   = re.compile(r"^CreateTime:(\d+)\s+(.*)$")
@@ -116,17 +139,17 @@ def process_chunk(args):
         recs_seen += 1
         raw = clean_text(payload)
 
-        # Check broad pattern; if found but MOBILE_REGEX misses, log error
+        # 1) Broad check: any exact-10-digit (with prefix) NOT surrounded by other digits?
         broad_hit = bool(BROAD_REGEX.search(raw))
         hits = list(pat_mobile.finditer(raw))
         if not hits:
             if broad_hit:
-                # record skipped line
+                # BOUNDARY‐aware MOBILE_REGEX failed → log to error_lines.txt
                 error_list.append(f"{identifier} | CreateTime:{ts} | {raw}")
             continue
         recs_with_mobile += 1
 
-        # 1) Flatten any valid JSON
+        # 2) Attempt to flatten valid JSON
         flat = {}
         try:
             obj = json.loads(raw)
@@ -134,18 +157,18 @@ def process_chunk(args):
         except json.JSONDecodeError:
             pass
 
-        # 2) XML <name="mobile" value=...> patterns
-        xml_map = {m.group(1): "mobile.value" for m in XML_RE.finditer(raw)}
-        # 2b) direct mobile="..." fallback
+        # 3) XML <name="mobile" value=...> (or tagname) with dynamic key
+        xml_map = {m.group(1): "mobile" for m in XML_RE.finditer(raw)}
+        # 3b) fallback for any mobile="..."
         xml_attr_map = {m.group(1): "mobile" for m in XML_ATTR_RE.finditer(raw)}
 
-        # 3) Nested JSON name/value
-        nested_map = {m.group(1): "mobile.value" for m in NESTED_JSON_RE.finditer(raw)}
+        # 4) Nested JSON "name":"mobile","value":...
+        nested_map = {m.group(1): "mobile" for m in NESTED_JSON_RE.finditer(raw)}
 
-        # 4) Unescape minimal JSON for KV_RE
+        # 5) Prepare unescaped text for KV_RE and KEYWORD_MOBILE_RE
         raw_unesc = raw.replace('\\"', '"')
 
-        # Build Word paragraph
+        # Build Word paragraph (highlight mobiles & fields)
         para = doc.add_paragraph(f"{identifier} | CreateTime:{ts} | ")
         last = 0
         fields = []
@@ -159,16 +182,16 @@ def process_chunk(args):
             run.font.color.rgb = RGBColor(255, 0, 0)
             last = e
 
-            # Find field name
+            # --- Field lookup cascade ---
             field = ""
 
-            # a) in flattened JSON
+            # a) Exact or substring match in flattened JSON
             for path, val in flat.items():
                 if str(val) == mobile or (isinstance(val, str) and mobile in val):
                     field = path
                     break
 
-            # b) generic KV_RE
+            # b) Generic key:value regex on unescaped JSON
             if not field:
                 m1 = re.search(r'"([^"]+)"\s*:\s*"' + re.escape(mobile) + r'"', raw_unesc)
                 if m1:
@@ -178,15 +201,21 @@ def process_chunk(args):
                     if m2:
                         field = m2.group(1)
 
-            # c) nested JSON
+            # c) Dynamic key fallback (phone/mobile/customer/cust/contact)
+            if not field:
+                km = KEYWORD_MOBILE_RE.search(raw_unesc)
+                if km and km.group(2) == mobile:
+                    field = km.group(1)
+
+            # d) Nested JSON fallback → field = "mobile"
             if not field and mobile in nested_map:
                 field = nested_map[mobile]
 
-            # d) XML tag
+            # e) XML tag fallback → field = "mobile"
             if not field and mobile in xml_map:
                 field = xml_map[mobile]
 
-            # e) XML attribute mobile="..."
+            # f) XML attribute fallback → field = "mobile"
             if not field and mobile in xml_attr_map:
                 field = xml_attr_map[mobile]
 
@@ -196,7 +225,7 @@ def process_chunk(args):
         if last < len(raw):
             para.add_run(raw[last:])
 
-        # Append fields list in red
+        # Append field names (in red)
         para.add_run(" | field: ")
         for i, fld in enumerate(fields):
             if i:
@@ -204,7 +233,7 @@ def process_chunk(args):
             fr = para.add_run(fld)
             fr.font.color.rgb = RGBColor(255, 0, 0)
 
-    # Save Word chunk if matches found
+    # Save Word chunk if any matches found
     if matches_data:
         os.makedirs(TEMP_DIR, exist_ok=True)
         doc.save(os.path.join(TEMP_DIR, f"chunk_{idx}.docx"))
@@ -227,28 +256,52 @@ def merge_word():
                 nr.bold, nr.italic, nr.underline = run.bold, run.italic, run.underline
     merged.save(OUTPUT_DOCX)
 
-# === WRITE EXCEL ===
-def write_excel(all_matches):
+# === WRITE EXCEL (Matches + Error Table) ===
+def write_excel(all_matches, error_list):
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
-    ws = wb.add_worksheet()
+    ws = wb.add_worksheet("Mobiles + Errors")
     red = wb.add_format({'font_color':'red'})
-    ws.write_row(0, 0, ["Identifier","Timestamp","Payload","Mobile","Field"])
-    r = 1
+    bold = wb.add_format({'bold': True})
+
+    # 1) Header for valid matches
+    ws.write_row(0, 0, ["Identifier","Timestamp","Payload","Mobile","Field"], bold)
+    row = 1
     for ident, ts, payload, mobile, field in all_matches:
-        ws.write(r, 0, ident)
-        ws.write(r, 1, ts)
-        ws.write(r, 2, payload)
-        ws.write(r, 3, mobile, red)
-        ws.write(r, 4, field)
-        r += 1
+        ws.write(row, 0, ident)
+        ws.write(row, 1, ts)
+        ws.write(row, 2, payload)
+        ws.write(row, 3, mobile, red)
+        ws.write(row, 4, field)
+        row += 1
+
+    # 2) Blank row
+    row += 1
+
+    # 3) Header for error records
+    ws.write_row(row, 0, ["Error: Identifier","Timestamp","Payload"], bold)
+    row += 1
+
+    # 4) Write each error line
+    for err in error_list:
+        parts = err.split(" | ", 2)
+        if len(parts) == 3:
+            ws.write(row, 0, parts[0])
+            ws.write(row, 1, parts[1])
+            ws.write(row, 2, parts[2])
+        else:
+            # Put entire line into payload column if split fails
+            ws.write(row, 2, err)
+        row += 1
+
     wb.close()
 
+# === MAIN ===
 if __name__ == "__main__":
     # Clean up any prior temp
     if os.path.isdir(TEMP_DIR):
         shutil.rmtree(TEMP_DIR)
 
-    print("=== MOBILE EXTRACTOR (with error‐line logging) ===")
+    print("=== MOBILE EXTRACTOR (Dynamic Field Lookup + Error Logging) ===")
     records = load_records()
     print(f"Total records: {len(records)}")
 
@@ -272,7 +325,7 @@ if __name__ == "__main__":
         tot += recs
         has += with_mobile
 
-    print(f"Records scanned: {tot}, with mobile: {has}, matches: {len(all_matches)}")
+    print(f"Records scanned: {tot}, with mobile‐records: {has}, total matches: {len(all_matches)}")
 
     # Write error lines to text file
     with open(ERROR_LINES_TXT, 'w', encoding='utf-8') as ef:
@@ -282,12 +335,13 @@ if __name__ == "__main__":
     # Merge Word docs if any
     if os.path.isdir(TEMP_DIR):
         merge_word()
-    # Write Excel
-    write_excel(all_matches)
+
+    # Write Excel (valid matches + error table)
+    write_excel(all_matches, list(error_lines))
 
     # Clean up
     shutil.rmtree(TEMP_DIR)
 
     print(f"\n→ Word saved to {OUTPUT_DOCX}")
     print(f"→ Excel saved to {OUTPUT_XLSX}")
-    print(f"→ Errors saved to {ERROR_LINES_TXT}")
+    print(f"→ Error lines saved to {ERROR_LINES_TXT}")
