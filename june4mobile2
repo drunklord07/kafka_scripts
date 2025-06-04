@@ -1,0 +1,280 @@
+import os
+import re
+import json
+import shutil
+from multiprocessing import Pool, Manager, cpu_count
+from docx import Document
+from docx.shared import RGBColor
+import xlsxwriter
+from tqdm import tqdm
+
+# === CONFIG ===
+INPUT_FILE   = "input.txt"
+CHUNK_SIZE   = 2000
+
+# Core 10-digit body (starts 6–9), with optional +91, 91, or 0 prefix
+MOBILE_BODY  = r'(?:\+91[\-\s]?|91|0)?[6-9]\d{9}'
+
+# Only match if preceded/followed by JSON delimiters, whitespace, or start/end
+MOBILE_REGEX = (
+    rf'(?:^|(?<=[\s\[\]\{{\}},":\']))'
+    rf'({MOBILE_BODY})'
+    rf'(?=[\s\[\]\{{\}},":\']|$)'
+)
+
+# XML tag regex:
+#  - quoted: <name="mobile" value="9736862892">
+#  - unquoted: <name="mobile" value=9736862892>
+XML_RE = re.compile(
+    rf'<(?:tagname|name)\s*=\s*"mobile"\s+value\s*=\s*"?({MOBILE_BODY})"?' 
+)
+
+# Nested-JSON regex for:
+#  - quoted: "name":"mobile","value":"9736862892"
+#  - unquoted: "name":"mobile","value":9736862892
+NESTED_JSON_RE = re.compile(
+    rf'"name"\s*:\s*"mobile"\s*,\s*"value"\s*:\s*"?({MOBILE_BODY})"?' 
+)
+
+# Generic key:value regex for JSON:
+#  - "key":"9876543210"
+#  - "key":9876543210
+KV_RE = re.compile(
+    rf'"([^"]+)"\s*:\s*"(?:{MOBILE_BODY})"|'      # quoted value
+    rf'"([^"]+)"\s*:\s*({MOBILE_BODY})(?=[\s,}}\\]]|$)'  # unquoted
+)
+
+OUTPUT_DOCX  = "final_output_mobile_strict.docx"
+OUTPUT_XLSX  = "final_output_mobile_strict.xlsx"
+TEMP_DIR     = "temp_parts"
+
+# === UTILITIES ===
+def clean_text(s: str) -> str:
+    # Remove null bytes which break XML/Word
+    return s.replace('\x00', '')
+
+def flatten_json(obj, prefix=""):
+    """
+    Recursively flatten a dict or list. 
+    If a string value itself looks like JSON, parse it and flatten too.
+    Records list items under e.g. "accountno[0]": "9873659274".
+    """
+    flat = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            path = f"{prefix}{k}"
+            if isinstance(v, dict):
+                flat.update(flatten_json(v, path + "."))
+            elif isinstance(v, list):
+                for i, item in enumerate(v):
+                    if isinstance(item, (dict, list)):
+                        flat.update(flatten_json(item, f"{path}[{i}]."))
+                    else:
+                        flat[f"{path}[{i}]"] = item
+            elif isinstance(v, str) and v.strip().startswith(("{", "[")):
+                try:
+                    inner = json.loads(v)
+                except:
+                    flat[path] = v
+                else:
+                    flat.update(flatten_json(inner, path + "."))
+            else:
+                flat[path] = v
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            if isinstance(item, (dict, list)):
+                flat.update(flatten_json(item, f"{prefix}[{i}]."))
+            else:
+                flat[f"{prefix}[{i}]"] = item
+    return flat
+
+# === LOAD & GROUP RECORDS ===
+def load_records():
+    """
+    Reads INPUT_FILE line by line. Each non‐empty line that doesn't start
+    with CreateTime is taken as the identifier. Each CreateTime:<ts> <payload>
+    line pairs with that identifier to form a record.
+    """
+    records = []
+    last_id = None
+    ct_re   = re.compile(r"^CreateTime:(\d+)\s+(.*)$")
+    with open(INPUT_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+        for raw in f:
+            line = raw.rstrip('\r\n')
+            m = ct_re.match(line)
+            if m and last_id is not None:
+                ts      = m.group(1)
+                payload = clean_text(m.group(2))
+                records.append((last_id, ts, payload))
+            elif line.strip():
+                last_id = line.strip()
+    return records
+
+# === SPLIT INTO CHUNKS ===
+def chunk_records(records):
+    for i in range(0, len(records), CHUNK_SIZE):
+        yield records[i:i+CHUNK_SIZE], i // CHUNK_SIZE
+
+# === PROCESS ONE CHUNK ===
+def process_chunk(args):
+    chunk, idx, result_list = args
+    pat_mobile = re.compile(MOBILE_REGEX)
+    doc = Document()
+    matches_data = []
+    recs_seen = recs_with_mobile = 0
+
+    for identifier, ts, payload in chunk:
+        recs_seen += 1
+        raw = clean_text(payload)
+        hits = list(pat_mobile.finditer(raw))
+        if not hits:
+            continue
+        recs_with_mobile += 1
+
+        # 1) Flatten any valid JSON for direct lookup
+        flat = {}
+        try:
+            obj = json.loads(raw)
+            flat = flatten_json(obj)
+        except json.JSONDecodeError:
+            pass
+
+        # 2) Find any XML tags <name="mobile" value=...> or <tagname="mobile" ...>
+        xml_map = {m.group(1): "mobile.value" for m in XML_RE.finditer(raw)}
+
+        # 3) Find nested JSON "name":"mobile","value":... patterns
+        nested_map = {m.group(1): "mobile.value" for m in NESTED_JSON_RE.finditer(raw)}
+
+        # 4) Prepare minimal unescaped text for KV_RE to match
+        raw_unesc = raw.replace('\\"', '"')
+
+        # Build Word paragraph, highlighting mobiles
+        para = doc.add_paragraph(f"{identifier} | CreateTime:{ts} | ")
+        last = 0
+        fields = []
+
+        for m in hits:
+            s, e = m.span(1)
+            if s > last:
+                para.add_run(raw[last:s])
+            mobile = m.group(1)
+            run = para.add_run(mobile)
+            run.font.color.rgb = RGBColor(255, 0, 0)
+            last = e
+
+            # --- Field‐lookup cascade ---
+            field = ""
+
+            # a) Check flattened JSON map for exact or substring match
+            for path, val in flat.items():
+                if str(val) == mobile or (isinstance(val, str) and mobile in val):
+                    field = path
+                    break
+
+            # b) Fallback: generic "key":"<mobile>" or "key":<mobile>
+            if not field:
+                # quoted
+                m1 = re.search(r'"([^"]+)"\s*:\s*"' + re.escape(mobile) + r'"', raw_unesc)
+                if m1:
+                    field = m1.group(1)
+                else:
+                    # unquoted
+                    m2 = re.search(r'"([^"]+)"\s*:\s*' + re.escape(mobile) + r'(?=[\s,}\]]|$)', raw_unesc)
+                    if m2:
+                        field = m2.group(1)
+
+            # c) Fallback: nested JSON pattern
+            if not field and mobile in nested_map:
+                field = nested_map[mobile]
+
+            # d) Fallback: XML pattern
+            if not field and mobile in xml_map:
+                field = xml_map[mobile]
+
+            # If still no field, leave it as empty string (we record the match anyway)
+            fields.append(field)
+            matches_data.append((identifier, ts, raw, mobile, field))
+
+        if last < len(raw):
+            para.add_run(raw[last:])
+
+        # Append all field names (in red)
+        para.add_run(" | field: ")
+        for i, fld in enumerate(fields):
+            if i:
+                para.add_run(", ")
+            fr = para.add_run(fld)
+            fr.font.color.rgb = RGBColor(255, 0, 0)
+
+    # Save Word chunk if any mobiles found
+    if matches_data:
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        doc.save(os.path.join(TEMP_DIR, f"chunk_{idx}.docx"))
+
+    result_list.append((matches_data, recs_seen, recs_with_mobile))
+
+# === MERGE WORD CHUNKS ===
+def merge_word():
+    merged = Document()
+    for fn in tqdm(sorted(os.listdir(TEMP_DIR)), desc="Merging Word"):
+        if not fn.endswith(".docx"):
+            continue
+        sub = Document(os.path.join(TEMP_DIR, fn))
+        for para in sub.paragraphs:
+            out_p = merged.add_paragraph()
+            for run in para.runs:
+                nr = out_p.add_run(run.text)
+                if run.font.color and run.font.color.rgb:
+                    nr.font.color.rgb = run.font.color.rgb
+                nr.bold, nr.italic, nr.underline = run.bold, run.italic, run.underline
+    merged.save(OUTPUT_DOCX)
+
+# === WRITE EXCEL ===
+def write_excel(all_matches):
+    wb = xlsxwriter.Workbook(OUTPUT_XLSX)
+    ws = wb.add_worksheet()
+    red = wb.add_format({'font_color':'red'})
+    ws.write_row(0, 0, ["Identifier","Timestamp","Payload","Mobile","Field"])
+    r = 1
+    for ident, ts, payload, mobile, field in all_matches:
+        ws.write(r, 0, ident)
+        ws.write(r, 1, ts)
+        ws.write(r, 2, payload)
+        ws.write(r, 3, mobile, red)
+        ws.write(r, 4, field)
+        r += 1
+    wb.close()
+
+# === MAIN ===
+if __name__=="__main__":
+    if os.path.isdir(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
+
+    print("=== MOBILE EXTRACTOR (XML / Nested-JSON + Unquoted Value Support) ===")
+    records = load_records()
+    print(f"Total records: {len(records)}")
+    chunks = list(chunk_records(records))
+
+    manager = Manager()
+    results = manager.list()
+    with Pool(min(cpu_count(), len(chunks))) as pool:
+        list(tqdm(pool.imap_unordered(
+            process_chunk,
+            [(chunk, idx, results) for chunk, idx in chunks]
+        ), total=len(chunks), desc="Processing chunks"))
+
+    all_matches = []
+    tot = has = 0
+    for data, recs, with_mobile in results:
+        all_matches.extend(data)
+        tot += recs
+        has += with_mobile
+
+    print(f"Records scanned: {tot}, with mobile: {has}, matches: {len(all_matches)}")
+
+    if os.path.isdir(TEMP_DIR):
+        merge_word()
+    write_excel(all_matches)
+    shutil.rmtree(TEMP_DIR)
+
+    print(f"\n→ Word saved to {OUTPUT_DOCX}\n→ Excel saved to {OUTPUT_XLSX}")
