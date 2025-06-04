@@ -13,12 +13,13 @@ INPUT_FILE     = "input.txt"
 CHUNK_SIZE     = 2000
 
 # Regex for IP addresses: four octets of 1–3 digits separated by dots
-IP_REGEX       = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
+# Wrapped in a capturing group so m.group(1) returns the full IP
+IP_REGEX       = r'\b((?:[0-9]{1,3}\.){3}[0-9]{1,3})\b'
 
-# Body for generic key:value regex matching the same IP pattern
+# Body for generic key:value regex matching the same IP pattern (no lookarounds)
 IP_BODY        = r'(?:[0-9]{1,3}\.){3}[0-9]{1,3}'
 
-# Exact-match JSON: 
+# Exact-match JSON:
 #   "key":"IP" or "key":"[IP]" possibly followed by a dot,
 #   or unquoted "key":IP or "key":[IP] with dot or closing bracket/punctuation.
 KV_EXACT_RE    = re.compile(
@@ -102,7 +103,7 @@ def process_chunk(args):
         except json.JSONDecodeError:
             pass
 
-        # 2) Prepare unescaped fallback text
+        # 2) Prepare unescaped text for fallback regex
         raw_unesc = raw.replace('\\"', '"').replace('\\{', '{').replace('\\}', '}')
 
         # Start Word paragraph
@@ -111,6 +112,7 @@ def process_chunk(args):
         fields = []
 
         for m in hits:
+            # Now m.group(1) contains the full IP address
             s, e = m.span(1)
             if s > last:
                 para.add_run(raw[last:s])
@@ -134,7 +136,7 @@ def process_chunk(args):
                 if fm:
                     field = fm.group(1) or fm.group(3)
 
-            # c) Contains‐match: key where value contains ip even inside brackets or with trailing dot
+            # c) Contains-match: key where value contains ip even inside brackets or with trailing dot
             if not field:
                 patt_contains = re.compile(
                     rf'"([^"]+)"\s*:\s*"\[?[^"]*{re.escape(ip_addr)}[^"]*\]?"'
