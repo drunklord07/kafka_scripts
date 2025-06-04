@@ -27,8 +27,8 @@ KV_EXACT_RE    = re.compile(
     rf'"([^"]+)"\s*:\s*\[?({COORD_BODY})\]?(?=[\s,}}\]\.]|$)'    # "key":[coord] or "key":coord + lookahead
 )
 
-OUTPUT_DOCX    = "june4_test7_coords.docx"
-OUTPUT_XLSX    = "june4_test7_coords.xlsx"
+OUTPUT_DOCX    = "june_final_output_coords.docx"
+OUTPUT_XLSX    = "june_final_output_coords.xlsx"
 TEMP_DIR       = "temp_parts"
 
 # === UTILITIES ===
